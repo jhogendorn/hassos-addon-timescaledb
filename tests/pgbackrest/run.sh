@@ -167,6 +167,8 @@ case4() {
     log "4. the data directory is gone, the pointer is there: restore from the repository"
     docker stop fresh > /dev/null
     wipe_postgres "${D2}"
+    # Supervisor restores the empty data/postgres directory that the backup keeps (backup_exclude)
+    docker run --rm -v "${D2}:/data" alpine sh -c 'mkdir /data/postgres && chown 70:70 /data/postgres && chmod 700 /data/postgres'
     docker rm -f fresh > /dev/null
     start_addon fresh "${D2}"
     wait_for 300 "PostgreSQL is up after the restore" ready fresh
