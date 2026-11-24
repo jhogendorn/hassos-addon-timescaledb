@@ -20,6 +20,7 @@ S3_KEY=testkey
 S3_SECRET=testsecretkey
 FAILED=0
 PASSED=0
+STARTED=()
 
 log() { printf '\n== %s\n' "$*"; }
 
@@ -51,8 +52,10 @@ cleanup() {
     [[ -z "${KEEP:-}" ]] || { echo "KEEP set: containers and ${WORK} left in place"; return; }
     docker ps -aq --filter "label=pgbr-test" | while read -r c; do docker rm -f "${c}" > /dev/null 2>&1; done
     docker compose -f "${HERE}/compose.yaml" down -v > /dev/null 2>&1
-    docker run --rm -v "${WORK}:/w" alpine rm -rf /w/* > /dev/null 2>&1
-    rm -rf "${WORK}"
+    docker volume ls -q --filter "label=pgbr-test" | while read -r v; do docker volume rm "${v}" > /dev/null 2>&1; done
+    # The data belongs to the postgres user of the add-on, so it is removed from inside a container
+    docker run --rm -v "${WORK}:/w" alpine find /w -mindepth 1 -delete > /dev/null 2>&1
+    rmdir "${WORK}" 2> /dev/null || true
 }
 trap cleanup EXIT
 
@@ -74,8 +77,9 @@ s3_options() { # extra pgbackrest JSON, merged over the S3 defaults
 start_addon() {
     local name="${1}" data="${2}"; shift 2
     docker rm -f "${name}" > /dev/null 2>&1
+    STARTED+=("${name}")
     docker run -d --name "${name}" --label pgbr-test --network "${NET}" \
-        -v "${data}:/data" -v "${data}-config:/config" -v "${data}-share:/share" \
+        -v "${data}:/data" -v "${data}-config:/config" -v "${SHARE_MOUNT:-${data}-share}:/share" \
         -e PGBR_LOOP_SECONDS=3 "$@" "${IMAGE}" > /dev/null
 }
 
@@ -118,6 +122,7 @@ case1() {
         # No options at all: the add-on without the feature cannot read options.json in standalone mode
         local img="${IMAGE}"; [[ "${which}" == old ]] && img="${UPSTREAM_IMAGE}"
         docker rm -f "off-${which}" > /dev/null 2>&1
+        STARTED+=("off-${which}")
         docker run -d --name "off-${which}" --label pgbr-test --network "${NET}" -v "${d}:/data" "${img}" > /dev/null
         wait_for 180 "off-${which} is up" ready "off-${which}"
         docker exec "off-${which}" /usr/share/timescaledb/backup_pre.sh > /dev/null 2>&1
@@ -244,10 +249,11 @@ case8() {
 }
 
 case9() {
-    log "9. a posix repository under /share"
+    log "9. a posix repository under /share (root-owned, as in Home Assistant)"
     local d; d="$(new_data posix)"
+    docker volume create --label pgbr-test pgbr-test-share > /dev/null
     write_options "${d}" '{"enabled": true, "repo_type": "posix", "stanza": "posix"}'
-    start_addon posix "${d}"
+    SHARE_MOUNT=pgbr-test-share start_addon posix "${d}"
     wait_for 240 "PostgreSQL is up" ready posix
     wait_for 120 "a full backup is in /share" bash -c "docker exec posix ls /share/timescaledb/pgbackrest/backup/posix | grep -q F"
     check "the repository is outside /data" bash -c "! docker exec posix ls /data | grep -q timescaledb"
@@ -259,7 +265,17 @@ CASES=("$@")
 [[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9)
 
 setup
-for c in "${CASES[@]}"; do "case${c}"; done
+for c in "${CASES[@]}"; do
+    STARTED=()
+    before="${FAILED}"
+    "case${c}"
+    if (( FAILED > before )); then
+        for name in "${STARTED[@]}"; do
+            printf '\n---- last log lines of %s ----\n' "${name}"
+            docker logs --tail 40 "${name}" 2>&1 | cut -c1-240
+        done
+    fi
+done
 
 printf '\n%s passed, %s failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]

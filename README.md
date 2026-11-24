@@ -449,7 +449,9 @@ pgbackrest:
   backup_time: "03:30" # in the add-on's time zone (default 03:30)
 ```
 
-Options (all but `enabled` are optional): `stanza` (default `timescaledb`), `repo_path` (default `/timescaledb/pgbackrest`), `s3_region` (default `us-east-1`), `s3_verify_tls` (default true), `block_incremental` (default true: differential backups copy only the changed blocks of a file), `archive_queue_max` (default `2GiB`), `metrics_push_url` and `metrics_labels`.
+Keep the repository out of any folder that a Home Assistant backup location lists (for an S3 backup location, its bucket prefix): that listing reads only a page of keys, and a repository holds many. The default `repo_path` for S3 is `/timescaledb/pgbackrest`, in the root of the bucket.
+
+Options (all but `enabled` are optional): `stanza` (default `timescaledb`), `repo_path` (default `/timescaledb/pgbackrest`; for `posix` a directory the add-on makes writable for the database, default `/share/timescaledb/pgbackrest`), `s3_region` (default `us-east-1`), `s3_verify_tls` (default true), `block_incremental` (default true: differential backups copy only the changed blocks of a file), `archive_queue_max` (default `2GiB`), `metrics_push_url` and `metrics_labels`.
 
 **Credentials.** Put `s3_key`, `s3_key_secret` and, to encrypt the repository (AES-256), `cipher_pass` in the options, or keep them out of Home Assistant backups by writing them to `/addon_configs/<this add-on's slug>/pgbackrest/credentials.conf` on the host:
 
