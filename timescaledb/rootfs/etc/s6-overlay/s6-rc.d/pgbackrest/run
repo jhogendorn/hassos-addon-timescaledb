@@ -193,7 +193,7 @@ while true; do
                 full|diff|incr) runBackup "${TYPE}" ;;
                 *) bashio::log.warning "Ignoring trigger-backup with type '${TYPE}': use full, diff or incr." ;;
             esac
-        elif [[ ! "$(date +%H:%M)" < "$(pgbr_opt backup_time 03:30)" ]] && [[ "$(< "${SCHEDULED_FILE}" 2> /dev/null)" != "$(date +%F)" ]] && (( $(date +%s) >= RETRY_AT )); then
+        elif [[ ! "$(date +%H:%M)" < "$(pgbr_opt backup_time 03:30)" ]] && [[ "$(cat "${SCHEDULED_FILE}" 2> /dev/null)" != "$(date +%F)" ]] && (( $(date +%s) >= RETRY_AT )); then
             # Due: past backup_time, and no backup yet today (also catches up when started late)
             runBackup "$(scheduledType)"
         fi

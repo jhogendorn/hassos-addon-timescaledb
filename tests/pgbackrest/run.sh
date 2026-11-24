@@ -259,10 +259,23 @@ case9() {
     check "the repository is outside /data" bash -c "! docker exec posix ls /data | grep -q timescaledb"
 }
 
+case10() {
+    log "10. the scheduled backup runs once a day, not on every pass of the loop"
+    local d; d="$(new_data daily)"
+    # 00:00 is always past, so today's backup is due as soon as the add-on is up
+    write_options "${d}" "$(s3_options '{"stanza": "daily", "backup_time": "00:00"}')"
+    start_addon daily "${d}"
+    wait_for 240 "PostgreSQL is up" ready daily
+    wait_for 120 "the first backup exists" bash -c "[[ \"\$(docker exec daily s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=daily info --output=json | jq -r '[.[].backup[]?] | length')\" -ge 1 ]]"
+    local before; before="$(backup_count daily daily)"
+    sleep 20
+    check "no further backup in 20 s (the loop runs every 3 s)" bash -c "[[ \"\$(docker exec daily s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=daily info --output=json | jq -r '[.[].backup[]?] | length')\" == '${before}' ]]"
+}
+
 # ---- main -------------------------------------------------------------------
 
 CASES=("$@")
-[[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9)
+[[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9 10)
 
 setup
 for c in "${CASES[@]}"; do
