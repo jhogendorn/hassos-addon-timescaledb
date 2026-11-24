@@ -1,6 +1,6 @@
 ---
 name: TimescaleDB (pgBackRest)
-version: 6.1.1-pgbr.1
+version: 6.1.1-pgbr.2
 slug: timescaledb
 description: "An open-source database built on PostgreSQL for
   analyzing time-series data with the power and convenience of SQL"
