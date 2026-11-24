@@ -15,12 +15,15 @@ map:
   - share:rw
   - backup:rw
   - media:rw
+  - addon_config:rw
 timeout: 60
 backup_pre: /usr/share/timescaledb/backup_pre.sh
 backup_post: /usr/share/timescaledb/backup_post.sh
 backup_exclude:
   - data/postgres/**
   - postgres/**
+  - pgbackrest/credentials.conf
+  - pgbackrest/spool/**
 ports:
   5432/tcp:
 ports_description:
@@ -43,7 +46,31 @@ options:
   retry_upgrade: false
   postgresql_settings: []
   pg_hba_config: []
+  pgbackrest:
+    enabled: false
 schema:
+  pgbackrest:
+    enabled: bool
+    stanza: "match(^[A-Za-z0-9_-]+$)?"
+    repo_type: "list(s3|posix)?"
+    repo_path: "match(^/[^\\s]*$)?"
+    s3_endpoint: "match(^[^\\s/]+$)?"
+    s3_bucket: "match(^[A-Za-z0-9._-]+$)?"
+    s3_region: "match(^[A-Za-z0-9-]+$)?"
+    s3_uri_style: "list(host|path)?"
+    s3_verify_tls: bool?
+    s3_key: password?
+    s3_key_secret: password?
+    cipher_pass: password?
+    retention_full: int(1,)?
+    full_day: "list(mon|tue|wed|thu|fri|sat|sun)?"
+    backup_time: "match(^([01][0-9]|2[0-3]):[0-5][0-9]$)?"
+    block_incremental: bool?
+    archive_queue_max: "match(^[0-9]+(B|KiB|MiB|GiB|TiB)$)?"
+    restore_from_repo: bool?
+    metrics_push_url: url?
+    metrics_labels:
+      - "match(^[a-z_][a-z0-9_]*=[^,\"\\s]*$)?"
   postgres_password: password?
   databases:
     - str

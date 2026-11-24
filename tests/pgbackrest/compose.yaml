@@ -1,0 +1,16 @@
+---
+# S3 repository (SeaweedFS, TLS with a throwaway certificate) for the pgBackRest tests.
+# Started by run.sh, which sets PGBR_TEST_CERTS.
+name: pgbrtest
+services:
+  s3:
+    image: chrislusf/seaweedfs:latest
+    command: >-
+      server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/s3.json
+      -s3.cert.file=/certs/public.crt -s3.key.file=/certs/private.key
+    volumes:
+      - ${PGBR_TEST_CERTS}:/certs:ro
+      - ./s3.json:/etc/s3.json:ro
+networks:
+  default:
+    name: pgbr-test

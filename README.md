@@ -433,6 +433,49 @@ Do not use `pg_restore -j` (parallel): it does not restore the TimescaleDB catal
 - Ensure there's sufficient disk space: the compressed dump plus 1 GiB
 - Review the addon logs for specific error messages
 
+### Point in time recovery with pgBackRest (optional)
+
+The dump above grows with the database and is taken inside the Home Assistant backup. For a large database you can use [pgBackRest](https://pgbackrest.org) instead: it archives the WAL continuously and takes full and differential backups to a repository outside Home Assistant, so you can recover to any moment and the Home Assistant backup stays tiny. It is **off by default**: with `pgbackrest.enabled: false` the add-on behaves exactly as described above.
+
+```yaml
+pgbackrest:
+  enabled: true
+  repo_type: s3                 # or posix: the repository is a directory, by default /share/timescaledb/pgbackrest
+  s3_endpoint: s3.example.com
+  s3_bucket: backups
+  s3_uri_style: path            # host (default) or path
+  retention_full: 4             # full backups to keep (default 4)
+  full_day: sun                 # full backup day, the other days a differential (default sun)
+  backup_time: "03:30"          # in the add-on's time zone (default 03:30)
+```
+
+Options (all but `enabled` are optional): `stanza` (default `timescaledb`), `repo_path` (default `/timescaledb/pgbackrest`), `s3_region` (default `us-east-1`), `s3_verify_tls` (default true), `block_incremental` (default true: differential backups copy only the changed blocks of a file), `archive_queue_max` (default `2GiB`), `metrics_push_url` and `metrics_labels`.
+
+**Credentials.** Put `s3_key`, `s3_key_secret` and, to encrypt the repository (AES-256), `cipher_pass` in the options, or keep them out of Home Assistant backups by writing them to `/addon_configs/<this add-on's slug>/pgbackrest/credentials.conf` on the host:
+
+```ini
+[global]
+repo1-s3-key=...
+repo1-s3-key-secret=...
+repo1-cipher-pass=...
+```
+
+That file is excluded from Home Assistant backups, and re-read when it changes, so a rotated key needs no restart. When both are set the options win. Keep the cipher passphrase somewhere safe: without it the repository cannot be read.
+
+**What it does.** WAL is archived to the repository (`archive_timeout` is 5 minutes), a full backup is taken on `full_day` and a differential on the other days, and the first backup is taken as soon as the repository is ready. `archive_mode`, `archive_command`, `archive_library`, `archive_timeout` and `wal_level` are managed by the add-on while it is enabled and ignored in `postgresql_settings`. To take a backup now, write its type to `/data/pgbackrest/trigger-backup` (`full`, `diff` or `incr`). Run `pgbackrest` yourself in the add-on's container with `--config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=<stanza> info`.
+
+**Home Assistant backups** hold no dump while it is enabled, only a pointer (`/data/pgbackrest/pointer.json`, no secrets) to the repository, after a `pgbackrest check` that proves the WAL up to that moment is archived. If the check fails, the backup of the add-on fails: you are never given a backup that points at nothing.
+
+**Restoring.** When the data directory is gone and a pointer exists (after restoring a Home Assistant backup), or when you set `restore_from_repo: true` on a new add-on that joins an existing repository (a new host, or a renamed add-on), the add-on restores the latest backup and PostgreSQL replays the archived WAL before it accepts connections. `restore_from_repo` clears itself afterwards. If credentials are not there yet (the add-on that writes the credentials file may start after this one) it waits 10 minutes for them. If the restore cannot be completed the add-on **stops with an error and never creates an empty database** in place of the one that should come back; remove `/data/pgbackrest/pointer.json` to start a new database on purpose. Restoring needs a latest backup of the PostgreSQL major version this add-on runs (18).
+
+**Upgrades.** After the automatic PostgreSQL 17 to 18 upgrade the stanza is upgraded and a full backup is taken. WAL from before the upgrade stays in the repository under the old version.
+
+**If the repository is down** WAL queues up to `archive_queue_max`; beyond that it is *dropped* (and a warning is logged), so PostgreSQL never fills the disk. Point in time recovery then has a gap until the next backup.
+
+**Metrics.** `/data/pgbackrest/metrics.prom` (Prometheus text format) is rewritten every minute and, when `metrics_push_url` is set, posted there (best effort): `backup_job_stage_success{stage="backup|expire|check"}`, `backup_job_last_run_timestamp_seconds`, `backup_job_last_success_timestamp_seconds`, `backup_job_duration_seconds`, `backup_job_bytes`, `pgbackrest_archive_failed_count`, `pgbackrest_archive_last_archived_timestamp_seconds`, `pgbackrest_archive_queue_bytes`, `pgbackrest_archive_dropped_total` and `pgbackrest_db_info`. Each series also carries the `metrics_labels` (`name=value`).
+
+Tests: `tests/pgbackrest/run.sh` runs the add-on image against a SeaweedFS repository.
+
 ### Now what..
 
 Well.. Dive in!

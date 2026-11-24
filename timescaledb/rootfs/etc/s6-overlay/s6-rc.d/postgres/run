@@ -26,6 +26,12 @@ if [[ $(cat ${VERSION_FILE}) != "${BUILD_TIMESTAMP}" ]]; then
 	UPDATE=true
 fi
 
+# A data directory restored from a pgBackRest repository starts with a recovery (recovery.signal)
+declare RECOVERING=false
+if [[ -f "${POSTGRES_DATA}/recovery.signal" ]]; then
+	RECOVERING=true
+fi
+
 # Start Postgres
 bashio::log.info "Starting PostgreSQL.."
 su - postgres -c "postgres -D ${POSTGRES_DATA}" &
@@ -36,6 +42,16 @@ bashio::log.info "done"
 while ! psql -U "postgres" postgres -c "" 2> /dev/null; do
 	sleep 1
 done
+
+# During a recovery the server already accepts (read only) connections, before all WAL is replayed.
+# Everything below writes, so wait until the recovery is done and the server is promoted.
+if bashio::var.true "${RECOVERING}"; then
+	bashio::log.notice "Recovering from the pgBackRest repository, waiting for the WAL replay to finish.."
+	while [[ "$(psql -X -U postgres -d postgres -tAc 'select pg_is_in_recovery()' 2> /dev/null)" != "f" ]]; do
+		sleep 2
+	done
+	bashio::log.notice "Recovery finished."
+fi
 
 # Sets the password of the postgres superuser.
 # The password goes in as a psql variable (quoted by psql), and statement logging is off for

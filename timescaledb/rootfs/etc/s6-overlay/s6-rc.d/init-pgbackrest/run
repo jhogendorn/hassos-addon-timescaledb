@@ -1,0 +1,136 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: TimescaleDb
+# pgBackRest: writes the configuration, and restores the database from the
+# repository when the data directory is gone (after a Home Assistant restore, or
+# when restore_from_repo is set). Does nothing unless pgbackrest.enabled is true.
+#
+# When a restore is called for and cannot be completed, this script fails and the
+# container stops. It never leaves an empty data directory for init-addon to run
+# initdb on.
+# ==============================================================================
+# shellcheck source=/dev/null
+source /usr/share/timescaledb/pgbackrest_common.sh
+
+if ! pgbr_enabled; then
+    exit 0
+fi
+
+# Seconds to wait for the credentials after a restore: the add-on that renders the
+# credentials file starts after this one (PGBR_CREDENTIAL_WAIT_SECONDS overrides, for tests)
+declare WAIT_SECONDS="${PGBR_CREDENTIAL_WAIT_SECONDS:-600}"
+
+bashio::log.info "pgBackRest is enabled, writing its configuration.."
+pgbr_render_config
+
+# Moves a data directory that is not usable out of the way, keeping what is in it
+# $1: suffix
+moveAside() {
+    local target
+    if [[ -e "${PGBR_POSTGRES_DATA}" ]]; then
+        target="${PGBR_POSTGRES_DATA}.${1}.$(date +%Y%m%d_%H%M%S)"
+        mv "${PGBR_POSTGRES_DATA}" "${target}"
+        bashio::log.warning "Moved ${PGBR_POSTGRES_DATA} to ${target}"
+    fi
+}
+
+# Logs the failed step, keeps what is left of a half restored data directory, stops the add-on
+# $1: what failed
+restoreFailed() {
+    bashio::log.fatal "Restore from the pgBackRest repository failed: ${1}"
+    moveAside failed-restore
+    bashio::log.fatal "Not initializing an empty database. Fix the problem and start the add-on again."
+    exit 1
+}
+
+if [[ -f "${PGBR_POSTGRES_DATA}/PG_VERSION" ]]; then
+    exit 0
+fi
+
+# The data directory is gone or unusable: restore when the pointer of a Home Assistant
+# backup says so, or when asked to. Otherwise init-addon sets up a new database.
+declare WANT_RESTORE=false
+if [[ -f "${PGBR_POINTER}" ]]; then
+    bashio::log.notice "Found ${PGBR_POINTER}: restoring the database from the repository."
+    WANT_RESTORE=true
+elif bashio::config.true 'pgbackrest.restore_from_repo'; then
+    bashio::log.notice "restore_from_repo is set: restoring the database from the repository."
+    WANT_RESTORE=true
+fi
+if ! bashio::var.true "${WANT_RESTORE}"; then
+    exit 0
+fi
+
+# 1. Credentials: after a Home Assistant restore they are not in the backup, and whatever puts
+# them in /config/pgbackrest/credentials.conf may start after this add-on.
+declare WAITED=0
+while ! pgbr_credentials_ok; do
+    if (( WAITED >= WAIT_SECONDS )); then
+        restoreFailed "no credentials for the repository after ${WAIT_SECONDS}s (options, or ${PGBR_CREDENTIALS})"
+    fi
+    if (( WAITED % 30 == 0 )); then
+        bashio::log.warning "Waiting for the repository credentials (${PGBR_CREDENTIALS}).. ${WAITED}s of ${WAIT_SECONDS}s"
+    fi
+    sleep 5
+    WAITED=$(( WAITED + 5 ))
+    pgbr_render_secrets
+done
+
+# 2. The pointer must name the repository these options point at
+if [[ -f "${PGBR_POINTER}" ]]; then
+    declare -A WANTED=(
+        [stanza]="$(pgbr_stanza)"
+        [repo_type]="$(pgbr_repo_type)"
+        [repo_path]="$(pgbr_repo_path)"
+    )
+    if [[ "$(pgbr_repo_type)" == "s3" ]]; then
+        WANTED[repo_s3_endpoint]="$(pgbr_opt s3_endpoint)"
+        WANTED[repo_s3_bucket]="$(pgbr_opt s3_bucket)"
+    fi
+    for field in "${!WANTED[@]}"; do
+        if [[ "$(jq -r --arg f "${field}" '.[$f] // ""' "${PGBR_POINTER}")" != "${WANTED[${field}]}" ]]; then
+            restoreFailed "the options differ from ${PGBR_POINTER} in ${field}"
+        fi
+    done
+fi
+
+# 3. Restore the latest backup, replaying all WAL in the repository. PostgreSQL does the
+# recovery when it starts: restore leaves recovery.signal and a restore_command.
+moveAside corrupted
+mkdir -p "${PGBR_POSTGRES_DATA}"
+chown postgres:postgres "${PGBR_POSTGRES_DATA}"
+chmod 700 "${PGBR_POSTGRES_DATA}"
+bashio::log.info "Restoring.."
+declare RESTORE_LOG
+RESTORE_LOG="$(pgbr_run restore 2>&1)" || { echo "${RESTORE_LOG}"; restoreFailed "pgbackrest restore returned an error"; }
+echo "${RESTORE_LOG}"
+
+# 4. What came back must be what the pointer says
+if [[ ! -f "${PGBR_POSTGRES_DATA}/PG_VERSION" ]]; then
+    restoreFailed "the restore produced no data directory"
+fi
+if [[ "$(pgbr_pg_major)" != "18" ]]; then
+    restoreFailed "the latest backup is of PostgreSQL $(pgbr_pg_major), this add-on runs 18: it cannot replay that WAL"
+fi
+if [[ -f "${PGBR_POINTER}" ]]; then
+    declare POINTER_SYSTEM_ID
+    POINTER_SYSTEM_ID="$(jq -r '.system_id // ""' "${PGBR_POINTER}")"
+    if [[ -n "${POINTER_SYSTEM_ID}" ]] && [[ "$(pgbr_system_id)" != "${POINTER_SYSTEM_ID}" ]]; then
+        restoreFailed "the restored system identifier differs from the one in ${PGBR_POINTER}"
+    fi
+fi
+
+# 5. Remember where it came from
+sed -n 's/.*restore backup set \([^,]*\).*/\1/p' <<< "${RESTORE_LOG}" | tail -n 1 > "${PGBR_STATE}/restored-from"
+chown postgres:postgres "${PGBR_STATE}/restored-from"
+bashio::log.notice "Restored backup set $(< "${PGBR_STATE}/restored-from"). PostgreSQL replays the archived WAL when it starts."
+
+# restore_from_repo is a one-shot: clear it, so a later wipe cannot silently restore from the repository
+if bashio::config.true 'pgbackrest.restore_from_repo'; then
+    pgbr_set_option restore_from_repo false || bashio::log.warning "Could not clear restore_from_repo, please turn it off."
+fi
+
+# The first thing after a restore: a backup of the new timeline (see the pgbackrest service)
+echo diff > "${PGBR_STATE}/trigger-backup"
+chown postgres:postgres "${PGBR_STATE}/trigger-backup"

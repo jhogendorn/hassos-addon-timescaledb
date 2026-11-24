@@ -86,6 +86,14 @@ RUN --mount=type=cache,id=apk-${TARGETARCH}-${TARGETVARIANT},sharing=locked,targ
         postgresql18-contrib-jit \
         postgresql18-contrib
 
+# -----------------------------------------
+# pgBackRest (WAL archiving and backups, off unless the pgbackrest option is enabled)
+# -----------------------------------------
+# hadolint ignore=DL3018
+RUN --mount=type=cache,id=apk-${TARGETARCH}-${TARGETVARIANT},sharing=locked,target=/var/cache/apk \
+    set -ex \
+    && apk add pgbackrest
+
 # Set default postgresql version to 18
 RUN rm /usr/libexec/postgresql \
     && ln -s /usr/libexec/postgresql18 /usr/libexec/postgresql \

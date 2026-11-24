@@ -18,6 +18,23 @@ BUILD_TIMESTAMP="$(cat /build-timestamp)"
 # Restore functions, and backupAvailable to detect a database dump from a backup
 # shellcheck source=/dev/null
 source /usr/share/timescaledb/restore_from_backup.sh
+# shellcheck source=/dev/null
+source /usr/share/timescaledb/pgbackrest_common.sh
+
+# Stops the add-on instead of initializing a new database when the data is meant to come from
+# a pgBackRest repository: a pointer from a Home Assistant backup, or restore_from_repo.
+# init-pgbackrest has already restored it when it could, so when this is reached with an empty
+# data directory the restore did not happen. A database dump from a backup is still restored below.
+refuseEmptyInit () {
+	if backupAvailable; then
+		return 0
+	fi
+	if [[ -f "${PGBR_POINTER}" ]] || bashio::config.true 'pgbackrest.restore_from_repo'; then
+		bashio::log.fatal "The database is to come from the pgBackRest repository (${PGBR_POINTER} exists, or restore_from_repo is set), but there is none to start."
+		bashio::log.fatal "Not initializing an empty database. Enable pgbackrest and start the add-on again, or remove ${PGBR_POINTER} to start a new database."
+		exit 1
+	fi
+}
 
 # Returns success when extension $2 is installed in database $1.
 # Compares the query result instead of piping to 'grep -q': under bashio's pipefail,
@@ -186,11 +203,27 @@ upgradePostgreSQL() {
 	fi
 }
 
+# After pg_upgrade the cluster has a new system identifier, which the stanza has to learn
+# (stanza-upgrade, offline: before the new cluster starts), and the first backup of it must be a full one.
+# When the repository cannot be reached now the database still starts: the pgbackrest service retries.
+upgradePgBackRestStanza () {
+	bashio::log.info "Upgrading the pgBackRest stanza to PostgreSQL 18.."
+	mkdir -p "${PGBR_STATE}"
+	if pgbr_run --no-online stanza-upgrade; then
+		echo full > "${PGBR_STATE}/trigger-backup"
+	else
+		bashio::log.error "Could not upgrade the pgBackRest stanza, will retry once PostgreSQL runs. WAL is not archived until then."
+		echo full > "${PGBR_STATE}/stanza-upgrade-pending"
+	fi
+	chown -R postgres:postgres "${PGBR_STATE}"
+}
+
 # Prepare /tmp/pg_stat_tmp directory
 mkdir -p /tmp/pg_stat_tmp
 chown postgres:postgres /tmp/pg_stat_tmp
 
 if ! bashio::fs.directory_exists "${POSTGRES_DATA}"; then
+    refuseEmptyInit
     bashio::log.info "Detected a fresh installation! Welcome! We're setting things up for you.."
     NEW_INSTALL=true
     
@@ -206,6 +239,7 @@ else
 
 	# Check if PG_VERSION exists – if it is absent the data directory is empty or corrupted
 	if [[ ! -f "${POSTGRES_DATA}/PG_VERSION" ]]; then
+	    refuseEmptyInit
 	    NEW_INSTALL=true
 	    # Move the invalid/empty directory aside so we can start fresh
 	    if [[ -d "${POSTGRES_DATA}" ]]; then
@@ -291,6 +325,9 @@ else
 		bashio::log.notice "A database upgrade is required from Postgres 17 -> 18"
 		if upgradePostgreSQL 17 18; then
 			bashio::log.notice "Upgrade was succesful"
+			if pgbr_enabled; then
+				upgradePgBackRestStanza
+			fi
 		else
 			bashio::log.error "Upgrade was not succesful."
 			exit 1

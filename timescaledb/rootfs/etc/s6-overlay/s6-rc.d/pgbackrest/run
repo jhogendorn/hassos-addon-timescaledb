@@ -1,0 +1,204 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: TimescaleDb
+# pgBackRest service: creates the stanza, takes the scheduled backups, writes metrics.
+# Does nothing (and stays down) unless pgbackrest.enabled is true.
+#
+# A failed backup is logged and counted, never fatal: this loop must not take the
+# database down.
+# ==============================================================================
+# shellcheck source=/dev/null
+source /usr/share/timescaledb/pgbackrest_common.sh
+
+if ! pgbr_enabled; then
+    exec s6-svc -Od .
+fi
+
+# Seconds between two passes of the loop (PGBR_LOOP_SECONDS overrides, for tests)
+declare LOOP_SECONDS="${PGBR_LOOP_SECONDS:-60}"
+declare METRICS_FILE="${PGBR_STATE}/metrics.prom"
+declare TRIGGER_FILE="${PGBR_STATE}/trigger-backup"
+declare SCHEDULED_FILE="${PGBR_STATE}/last-scheduled"
+
+declare -A STAGE_OK=([backup]=0 [expire]=0 [check]=0)
+declare LAST_RUN_TS=0
+declare LAST_SUCCESS_TS=0
+declare LAST_DURATION=0
+declare LAST_BYTES=0
+declare DROPPED_SEEN=0
+declare STANZA_READY=false
+declare CREDENTIALS_SUM=""
+declare RETRY_AT=0
+
+# Runs SQL as postgres, quietly: empty output when it fails
+sql() {
+    psql -X -U postgres -d postgres -tA -F '|' -c "${1}" 2> /dev/null || true
+}
+
+# Metric labels: the metrics_labels option, plus an extra one such as stage="backup" ($1)
+labels() {
+    local out="" label key value
+    while IFS= read -r label; do
+        [[ -n "${label}" ]] || continue
+        key="${label%%=*}"
+        value="${label#*=}"
+        out="${out:+${out},}${key}=\"${value}\""
+    done < <(bashio::config 'pgbackrest.metrics_labels' 2> /dev/null | grep -v '^null$' || true)
+    out="${out:+${out},}${1:-}"
+    out="${out%,}"
+    [[ -z "${out}" ]] || printf '{%s}' "${out}"
+}
+
+# Writes the metrics file atomically, and posts it to metrics_push_url when that is set.
+# The names follow the backup_job_* convention of Prometheus style backup monitoring.
+writeMetrics() {
+    local archiver failed last_archived queue_kb dropped info
+    archiver="$(sql 'select failed_count, coalesce(extract(epoch from last_archived_time)::bigint, 0) from pg_stat_archiver')"
+    failed="${archiver%%|*}"
+    last_archived="${archiver##*|}"
+    queue_kb="$(du -sk "${PGBR_STATE}/spool" 2> /dev/null | cut -f1)"
+    dropped="$(cat "${PGBR_STATE}"/log/*archive-push*.log 2> /dev/null | grep -c 'dropped WAL' || true)"
+
+    {
+        for stage in backup expire check; do
+            echo "backup_job_stage_success$(labels "stage=\"${stage}\"") ${STAGE_OK[${stage}]}"
+        done
+        echo "backup_job_last_run_timestamp_seconds$(labels) ${LAST_RUN_TS}"
+        echo "backup_job_last_success_timestamp_seconds$(labels) ${LAST_SUCCESS_TS}"
+        echo "backup_job_duration_seconds$(labels) ${LAST_DURATION}"
+        echo "backup_job_bytes$(labels) ${LAST_BYTES}"
+        echo "pgbackrest_archive_failed_count$(labels) ${failed:-0}"
+        echo "pgbackrest_archive_last_archived_timestamp_seconds$(labels) ${last_archived:-0}"
+        echo "pgbackrest_archive_queue_bytes$(labels) $(( ${queue_kb:-0} * 1024 ))"
+        echo "pgbackrest_archive_dropped_total$(labels) ${dropped:-0}"
+        info="pg_version=\"$(sql 'show server_version')\",timescaledb_version=\"$(sql "select default_version from pg_available_extensions where name = 'timescaledb'")\",system_id=\"$(sql 'select system_identifier from pg_control_system()')\""
+        echo "pgbackrest_db_info$(labels "${info}") 1"
+    } > "${METRICS_FILE}.new"
+    mv "${METRICS_FILE}.new" "${METRICS_FILE}"
+
+    if (( dropped > DROPPED_SEEN )); then
+        bashio::log.warning "pgBackRest dropped WAL because the archive queue passed archive_queue_max: point in time recovery has a gap until the next backup."
+    fi
+    DROPPED_SEEN="${dropped}"
+
+    if bashio::config.has_value 'pgbackrest.metrics_push_url'; then
+        curl -sS --max-time 10 --data-binary "@${METRICS_FILE}" "$(bashio::config 'pgbackrest.metrics_push_url')" > /dev/null \
+            || bashio::log.warning "Could not push the metrics to metrics_push_url."
+    fi
+}
+
+# Repository size of the latest backup, from pgbackrest info
+latestBackupBytes() {
+    pgbr_run info --output=json 2> /dev/null \
+        | jq -r '[.[].backup[]?] | sort_by(.timestamp.stop) | last | .info.repository.size // 0' 2> /dev/null || echo 0
+}
+
+# Newest backup (stop timestamp, seconds), 0 when there is none
+latestBackupTs() {
+    pgbr_run info --output=json 2> /dev/null \
+        | jq -r '[.[].backup[]?.timestamp.stop] | max // 0' 2> /dev/null || echo 0
+}
+
+# Creates the stanza (idempotent) and checks it. Not fatal: it is retried every pass.
+prepareStanza() {
+    if [[ -f "${PGBR_STATE}/stanza-upgrade-pending" ]]; then
+        if pgbr_run stanza-upgrade; then
+            rm -f "${PGBR_STATE}/stanza-upgrade-pending"
+            echo full > "${TRIGGER_FILE}"
+        else
+            bashio::log.error "pgBackRest stanza-upgrade failed, WAL is not archived until it succeeds."
+            return 1
+        fi
+    fi
+    if ! pgbr_run stanza-create; then
+        bashio::log.error "pgBackRest stanza-create failed: check the repository settings and credentials. (A database with another system identifier owns this stanza when pgBackRest says the info files do not match.)"
+        return 1
+    fi
+    if ! pgbr_run check; then
+        bashio::log.error "pgBackRest check failed: WAL archiving does not work."
+        return 1
+    fi
+    STANZA_READY=true
+}
+
+# Backup, expire and check, with their results in the metrics
+# $1: backup type (full, diff or incr)
+runBackup() {
+    local type="${1}" started
+    started="$(date +%s)"
+    STAGE_OK=([backup]=0 [expire]=0 [check]=0)
+    LAST_RUN_TS="${started}"
+    bashio::log.info "Starting a ${type} backup.."
+    if pgbr_run backup "--type=${type}"; then
+        STAGE_OK[backup]=1
+        # Today's backup is taken, whatever started it, so the schedule does not add another
+        date +%F > "${SCHEDULED_FILE}"
+        LAST_SUCCESS_TS="$(date +%s)"
+        LAST_BYTES="$(latestBackupBytes)"
+        bashio::log.info "Backup done."
+    else
+        bashio::log.error "pgBackRest ${type} backup failed, trying again in an hour."
+        RETRY_AT=$(( $(date +%s) + 3600 ))
+    fi
+    if pgbr_run expire; then STAGE_OK[expire]=1; else bashio::log.error "pgBackRest expire failed."; fi
+    if pgbr_run check; then STAGE_OK[check]=1; else bashio::log.error "pgBackRest check failed after the backup."; fi
+    LAST_DURATION=$(( $(date +%s) - started ))
+}
+
+# Backup type for today's scheduled backup: full on full_day, diff on the others
+scheduledType() {
+    local today full_day
+    today="$(date +%a | tr '[:upper:]' '[:lower:]')"
+    full_day="$(pgbr_opt full_day sun)"
+    if [[ "${today}" == "${full_day}" ]]; then echo full; else echo diff; fi
+}
+
+# Checksum of the credentials file, empty when there is none
+credentialsSum() {
+    if [[ -f "${PGBR_CREDENTIALS}" ]]; then cksum < "${PGBR_CREDENTIALS}"; fi
+}
+
+# Wait until PostgreSQL accepts writes (after a restore it replays WAL first)
+until [[ "$(sql 'select not pg_is_in_recovery()')" == "t" ]]; do
+    sleep 2
+done
+
+bashio::log.info "pgBackRest service started for stanza $(pgbr_stanza)."
+CREDENTIALS_SUM="$(credentialsSum)"
+
+while true; do
+    # A rotated credentials file is picked up without a restart
+    NEW_SUM="$(credentialsSum)"
+    if [[ "${NEW_SUM}" != "${CREDENTIALS_SUM}" ]]; then
+        bashio::log.info "The credentials file changed, reloading it."
+        pgbr_render_secrets
+        CREDENTIALS_SUM="${NEW_SUM}"
+    fi
+
+    if ! bashio::var.true "${STANZA_READY}"; then
+        prepareStanza || true
+        # A new repository has no backup yet: take one at once, and catch up after a gap
+        # of more than 26 hours (a powered off night)
+        if bashio::var.true "${STANZA_READY}" && (( $(date +%s) - $(latestBackupTs) > 93600 )); then
+            echo full > "${TRIGGER_FILE}"
+        fi
+    fi
+
+    if bashio::var.true "${STANZA_READY}"; then
+        if [[ -f "${TRIGGER_FILE}" ]]; then
+            TYPE="$(tr -d '[:space:]' < "${TRIGGER_FILE}")"
+            rm -f "${TRIGGER_FILE}"
+            case "${TYPE}" in
+                full|diff|incr) runBackup "${TYPE}" ;;
+                *) bashio::log.warning "Ignoring trigger-backup with type '${TYPE}': use full, diff or incr." ;;
+            esac
+        elif [[ ! "$(date +%H:%M)" < "$(pgbr_opt backup_time 03:30)" ]] && [[ "$(< "${SCHEDULED_FILE}" 2> /dev/null)" != "$(date +%F)" ]] && (( $(date +%s) >= RETRY_AT )); then
+            # Due: past backup_time, and no backup yet today (also catches up when started late)
+            runBackup "$(scheduledType)"
+        fi
+    fi
+
+    writeMetrics
+    sleep "${LOOP_SECONDS}"
+done

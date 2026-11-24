@@ -13,6 +13,8 @@
 # ==============================================================================
 # shellcheck source=/dev/null
 source /usr/share/timescaledb/backup_common.sh
+# shellcheck source=/dev/null
+source /usr/share/timescaledb/pgbackrest_common.sh
 
 declare DUMP_PID=""
 
@@ -59,6 +61,43 @@ fi
 
 # Leftovers of an interrupted backup
 removeDump
+
+# With pgBackRest the data is in the repository, not in this backup: the backup holds a pointer to
+# it, so a restore knows what to bring back. No dump is made.
+if pgbr_enabled; then
+    bashio::log.info "pgBackRest is enabled: writing a pointer to the repository instead of a dump."
+    # check switches the WAL segment and waits until it is archived, so the moment of this backup is recoverable
+    if ! pgbr_run check; then
+        bashio::log.error "pgBackRest check failed: this backup would not point to a recoverable database."
+        exit 1
+    fi
+    LABEL="$(pgbr_run info --output=json | jq -r --arg s "$(pgbr_stanza)" '[.[] | select(.name == $s) | .backup[]?] | sort_by(.timestamp.stop) | last | .label // empty')"
+    if [[ -z "${LABEL}" ]]; then
+        bashio::log.error "There is no backup in the pgBackRest repository yet: this backup would not point to a database."
+        exit 1
+    fi
+    mkdir -p "${PGBR_STATE}"
+    jq -n \
+        --arg stanza "$(pgbr_stanza)" \
+        --arg repo_type "$(pgbr_repo_type)" \
+        --arg endpoint "$(pgbr_opt s3_endpoint)" \
+        --arg bucket "$(pgbr_opt s3_bucket)" \
+        --arg repo_path "$(pgbr_repo_path)" \
+        --arg system_id "$(pgbr_system_id)" \
+        --arg pg_version "$(pgbr_pg_major)" \
+        --arg ts_version "$(psql -X -U postgres -d postgres -tAc "select default_version from pg_available_extensions where name = 'timescaledb'")" \
+        --arg label "${LABEL}" \
+        --arg lsn "$(psql -X -U postgres -d postgres -tAc 'select pg_current_wal_lsn()')" \
+        --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg addon_version "$(bashio::app.version 2> /dev/null || echo unknown)" \
+        '{format: 1, stanza: $stanza, repo_type: $repo_type, repo_s3_endpoint: $endpoint, repo_s3_bucket: $bucket,
+          repo_path: $repo_path, system_id: $system_id, pg_version: $pg_version, timescaledb_version: $ts_version,
+          backup_label: $label, wal_lsn: $lsn, time: $time, addon_version: $addon_version}' \
+        > "${PGBR_POINTER}.new"
+    mv "${PGBR_POINTER}.new" "${PGBR_POINTER}"
+    bashio::log.info "Pointer written to ${PGBR_POINTER} (backup ${LABEL}). Pre-backup process completed."
+    exit 0
+fi
 
 if [[ $(backupFreeSpaceMb) -lt ${BACKUP_MIN_FREE_MB} ]]; then
     fail "Only $(backupFreeSpaceMb) MiB free on /data, the dump needs to leave at least ${BACKUP_MIN_FREE_MB} MiB free. Free up disk space and try again."
