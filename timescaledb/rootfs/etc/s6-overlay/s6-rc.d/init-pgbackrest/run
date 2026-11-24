@@ -28,6 +28,8 @@ pgbr_render_config
 # $1: suffix
 moveAside() {
     local target
+    # Supervisor restores the empty directory that a backup keeps: there is nothing in it to save
+    rmdir "${PGBR_POSTGRES_DATA}" 2> /dev/null || true
     if [[ -e "${PGBR_POSTGRES_DATA}" ]]; then
         target="${PGBR_POSTGRES_DATA}.${1}.$(date +%Y%m%d_%H%M%S)"
         mv "${PGBR_POSTGRES_DATA}" "${target}"

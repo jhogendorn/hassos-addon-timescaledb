@@ -167,9 +167,12 @@ case4() {
     log "4. the data directory is gone, the pointer is there: restore from the repository"
     docker stop fresh > /dev/null
     wipe_postgres "${D2}"
+    # Supervisor restores the empty data/postgres directory that the backup keeps (backup_exclude)
+    docker run --rm -v "${D2}:/data" alpine sh -c 'mkdir /data/postgres && chown 70:70 /data/postgres && chmod 700 /data/postgres'
     docker rm -f fresh > /dev/null
     start_addon fresh "${D2}"
     wait_for 300 "PostgreSQL is up after the restore" ready fresh
+    check "an empty data directory is not reported as corrupted" logs_lack fresh 'Moved /data/postgres'
     check "the rows are back" bash -c "[[ \"\$(docker exec fresh psql -X -U postgres -tAc 'select count(*) from kept')\" == 1000 ]]"
     check "recovery went to a new timeline" bash -c "[[ \"\$(docker exec fresh psql -X -U postgres -tAc 'select timeline_id from pg_control_checkpoint()')\" -ge 2 ]]"
     psql_in fresh postgres 'select pg_switch_wal()' > /dev/null
@@ -219,7 +222,8 @@ case7() {
     check "a PostgreSQL 17 cluster with a stanza was made" bash -c "[[ \"\$(docker run --rm -v '${d}:/data' alpine cat /data/postgres/PG_VERSION)\" == 17 ]]"
     write_options "${d}" "$(s3_options '{"stanza": "pg17"}')"
     start_addon upgrade "${d}"
-    wait_for 400 "PostgreSQL 18 is up" ready upgrade
+    # ready alone also matches the PostgreSQL 17 the upgrade starts and stops again on a slow host
+    wait_for 400 "PostgreSQL 18 is up" bash -c "docker logs upgrade 2>&1 | grep -q 'TimescaleDb is running'"
     check "the cluster is PostgreSQL 18" bash -c "[[ \"\$(docker exec upgrade cat /data/postgres/PG_VERSION)\" == 18 ]]"
     check "the data survived" bash -c "[[ \"\$(docker exec upgrade psql -X -U postgres -tAc 'select count(*) from kept')\" == 1000 ]]"
     wait_for 120 "the stanza knows both versions and has a backup of PostgreSQL 18" bash -c "docker exec upgrade s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=pg17 info --output=json | jq -e '[.[].backup[]? | select(.database.id == 2 and .type == \"full\")] | length >= 1'"
@@ -259,10 +263,23 @@ case9() {
     check "the repository is outside /data" bash -c "! docker exec posix ls /data | grep -q timescaledb"
 }
 
+case10() {
+    log "10. the scheduled backup runs once a day, not on every pass of the loop"
+    local d; d="$(new_data daily)"
+    # 00:00 is always past, so today's backup is due as soon as the add-on is up
+    write_options "${d}" "$(s3_options '{"stanza": "daily", "backup_time": "00:00"}')"
+    start_addon daily "${d}"
+    wait_for 240 "PostgreSQL is up" ready daily
+    wait_for 120 "the first backup exists" bash -c "[[ \"\$(docker exec daily s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=daily info --output=json | jq -r '[.[].backup[]?] | length')\" -ge 1 ]]"
+    local before; before="$(backup_count daily daily)"
+    sleep 20
+    check "no further backup in 20 s (the loop runs every 3 s)" bash -c "[[ \"\$(docker exec daily s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=daily info --output=json | jq -r '[.[].backup[]?] | length')\" == '${before}' ]]"
+}
+
 # ---- main -------------------------------------------------------------------
 
 CASES=("$@")
-[[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9)
+[[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9 10)
 
 setup
 for c in "${CASES[@]}"; do
