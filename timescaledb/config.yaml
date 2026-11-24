@@ -1,6 +1,6 @@
 ---
-name: TimescaleDB
-version: dev
+name: TimescaleDB (pgBackRest)
+version: 6.1.1-pgbr.0
 slug: timescaledb
 description: "An open-source database built on PostgreSQL for
   analyzing time-series data with the power and convenience of SQL"
@@ -69,4 +69,4 @@ schema:
       address: str?
       method: list(trust|reject|md5|password|scram-sha-256|gss|sspi|ident|peer|pam|ldap|radius|cert)?
       options: str?
-image: ghcr.io/expaso/timescaledb/{arch}
+image: ghcr.io/jhogendorn/timescaledb/{arch}
