@@ -172,6 +172,7 @@ case4() {
     docker rm -f fresh > /dev/null
     start_addon fresh "${D2}"
     wait_for 300 "PostgreSQL is up after the restore" ready fresh
+    check "an empty data directory is not reported as corrupted" logs_lack fresh 'Moved /data/postgres'
     check "the rows are back" bash -c "[[ \"\$(docker exec fresh psql -X -U postgres -tAc 'select count(*) from kept')\" == 1000 ]]"
     check "recovery went to a new timeline" bash -c "[[ \"\$(docker exec fresh psql -X -U postgres -tAc 'select timeline_id from pg_control_checkpoint()')\" -ge 2 ]]"
     psql_in fresh postgres 'select pg_switch_wal()' > /dev/null
@@ -221,7 +222,8 @@ case7() {
     check "a PostgreSQL 17 cluster with a stanza was made" bash -c "[[ \"\$(docker run --rm -v '${d}:/data' alpine cat /data/postgres/PG_VERSION)\" == 17 ]]"
     write_options "${d}" "$(s3_options '{"stanza": "pg17"}')"
     start_addon upgrade "${d}"
-    wait_for 400 "PostgreSQL 18 is up" ready upgrade
+    # ready alone also matches the PostgreSQL 17 the upgrade starts and stops again on a slow host
+    wait_for 400 "PostgreSQL 18 is up" bash -c "docker logs upgrade 2>&1 | grep -q 'TimescaleDb is running'"
     check "the cluster is PostgreSQL 18" bash -c "[[ \"\$(docker exec upgrade cat /data/postgres/PG_VERSION)\" == 18 ]]"
     check "the data survived" bash -c "[[ \"\$(docker exec upgrade psql -X -U postgres -tAc 'select count(*) from kept')\" == 1000 ]]"
     wait_for 120 "the stanza knows both versions and has a backup of PostgreSQL 18" bash -c "docker exec upgrade s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=pg17 info --output=json | jq -e '[.[].backup[]? | select(.database.id == 2 and .type == \"full\")] | length >= 1'"
