@@ -440,13 +440,13 @@ The dump above grows with the database and is taken inside the Home Assistant ba
 ```yaml
 pgbackrest:
   enabled: true
-  repo_type: s3                 # or posix: the repository is a directory, by default /share/timescaledb/pgbackrest
+  repo_type: s3 # or posix: the repository is a directory, by default /share/timescaledb/pgbackrest
   s3_endpoint: s3.example.com
   s3_bucket: backups
-  s3_uri_style: path            # host (default) or path
-  retention_full: 4             # full backups to keep (default 4)
-  full_day: sun                 # full backup day, the other days a differential (default sun)
-  backup_time: "03:30"          # in the add-on's time zone (default 03:30)
+  s3_uri_style: path # host (default) or path
+  retention_full: 4 # full backups to keep (default 4)
+  full_day: sun # full backup day, the other days a differential (default sun)
+  backup_time: "03:30" # in the add-on's time zone (default 03:30)
 ```
 
 Options (all but `enabled` are optional): `stanza` (default `timescaledb`), `repo_path` (default `/timescaledb/pgbackrest`), `s3_region` (default `us-east-1`), `s3_verify_tls` (default true), `block_incremental` (default true: differential backups copy only the changed blocks of a file), `archive_queue_max` (default `2GiB`), `metrics_push_url` and `metrics_labels`.
@@ -470,7 +470,7 @@ That file is excluded from Home Assistant backups, and re-read when it changes, 
 
 **Upgrades.** After the automatic PostgreSQL 17 to 18 upgrade the stanza is upgraded and a full backup is taken. WAL from before the upgrade stays in the repository under the old version.
 
-**If the repository is down** WAL queues up to `archive_queue_max`; beyond that it is *dropped* (and a warning is logged), so PostgreSQL never fills the disk. Point in time recovery then has a gap until the next backup.
+**If the repository is down** WAL queues up to `archive_queue_max`; beyond that it is _dropped_ (and a warning is logged), so PostgreSQL never fills the disk. Point in time recovery then has a gap until the next backup.
 
 **Metrics.** `/data/pgbackrest/metrics.prom` (Prometheus text format) is rewritten every minute and, when `metrics_push_url` is set, posted there (best effort): `backup_job_stage_success{stage="backup|expire|check"}`, `backup_job_last_run_timestamp_seconds`, `backup_job_last_success_timestamp_seconds`, `backup_job_duration_seconds`, `backup_job_bytes`, `pgbackrest_archive_failed_count`, `pgbackrest_archive_last_archived_timestamp_seconds`, `pgbackrest_archive_queue_bytes`, `pgbackrest_archive_dropped_total` and `pgbackrest_db_info`. Each series also carries the `metrics_labels` (`name=value`).
 
