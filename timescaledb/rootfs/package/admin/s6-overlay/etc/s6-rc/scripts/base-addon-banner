@@ -16,8 +16,14 @@ BUILD_TIMESTAMP="$(cat /build-timestamp)"
 # options, so all scripts use their defaults as before, without trying the API every time.
 # Decided on the token, not on a failed ping: in Home Assistant a hiccup of the API must
 # not silently drop the configured options.
+# A /data/options.json, the file the Supervisor writes in Home Assistant, is used when it is
+# there, so a standalone container can be configured (and tested) the same way.
 if [[ -z "${SUPERVISOR_TOKEN:-}" ]]; then
-    bashio::cache.set "addons.self.options.config" "{}"
+    if [[ -s /data/options.json ]]; then
+        bashio::cache.set "addons.self.options.config" "$(< /data/options.json)"
+    else
+        bashio::cache.set "addons.self.options.config" "{}"
+    fi
 fi
 
 set +u
