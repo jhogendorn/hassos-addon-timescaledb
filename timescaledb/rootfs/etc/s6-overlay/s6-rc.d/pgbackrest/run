@@ -187,6 +187,13 @@ while true; do
         if bashio::var.true "${STANZA_READY}" && (( $(date +%s) - $(latestBackupTs) > 93600 )); then
             echo full > "${TRIGGER_FILE}"
         fi
+        # A restart must not report that no backup was ever taken
+        if bashio::var.true "${STANZA_READY}" && (( LAST_SUCCESS_TS == 0 )); then
+            LAST_SUCCESS_TS="$(latestBackupTs)"
+            LAST_RUN_TS="${LAST_SUCCESS_TS}"
+            LAST_BYTES="$(latestBackupBytes)"
+            (( LAST_SUCCESS_TS == 0 )) || STAGE_OK=([backup]=1 [expire]=0 [check]=1)  # check passed in prepareStanza; expire has not run
+        fi
     fi
 
     if bashio::var.true "${STANZA_READY}"; then
