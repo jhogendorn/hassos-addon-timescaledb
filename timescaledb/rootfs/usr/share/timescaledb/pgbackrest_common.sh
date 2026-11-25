@@ -134,9 +134,10 @@ pgbr_render_config() {
 # Writes /run/pgbackrest/conf.d/secrets.conf, readable by postgres: archive_command runs as it.
 pgbr_render_secrets() {
     local key secret cipher from_file=""
-    key="$(pgbr_opt s3_key)"
-    secret="$(pgbr_opt s3_key_secret)"
-    cipher="$(pgbr_opt cipher_pass)"
+    # Straight from the options file (0600), never through a command's arguments
+    key="$(jq -r '.pgbackrest.s3_key // empty' /data/options.json)"
+    secret="$(jq -r '.pgbackrest.s3_key_secret // empty' /data/options.json)"
+    cipher="$(jq -r '.pgbackrest.cipher_pass // empty' /data/options.json)"
 
     if [[ -f "${PGBR_CREDENTIALS}" ]]; then
         if [[ -n "${key}${secret}${cipher}" ]]; then
@@ -178,11 +179,16 @@ pgbr_credentials_ok() {
 # Sets an option below pgbackrest. to a JSON value, in the options of the add-on.
 # $1: option, $2: JSON value
 pgbr_set_option() {
-    local options
     if [[ -n "${SUPERVISOR_TOKEN:-}" ]]; then
-        options="$(bashio::addon.options)"
-        options="$(jq -c --argjson v "${2}" ".pgbackrest.${1} = \$v" <<< "${options}")"
-        bashio::api.supervisor POST /addons/self/options "$(jq -cn --argjson o "${options}" '{options: $o}')" > /dev/null
+        # The options may hold secrets: in a file, not in a command's arguments
+        (
+            umask 077
+            body="$(mktemp /dev/shm/pgbr.XXXXXX)"
+            trap 'rm -f "${body}"' EXIT
+            bashio::addon.options | jq -c --argjson v "${2}" ".pgbackrest.${1} = \$v | {options: .}" > "${body}"
+            printf 'Authorization: Bearer %s\n' "${SUPERVISOR_TOKEN}" | curl -sSf -X POST -H @- -H 'Content-Type: application/json' \
+                --data-binary "@${body}" http://supervisor/addons/self/options > /dev/null
+        )
     elif [[ -f /data/options.json ]]; then
         # Standalone: there is no Supervisor, the options file is all there is
         jq -c --argjson v "${2}" ".pgbackrest.${1} = \$v" /data/options.json > /data/options.json.new
