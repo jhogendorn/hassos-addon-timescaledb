@@ -98,14 +98,20 @@ if [[ -f "${PGBR_POINTER}" ]]; then
 fi
 
 # 3. Restore the latest backup, replaying all WAL in the repository. PostgreSQL does the
-# recovery when it starts: restore leaves recovery.signal and a restore_command.
+# recovery when it starts: restore leaves recovery.signal and a restore_command. With
+# restore_standby it leaves standby.signal instead: the server stays read only and follows
+# the repository until it is promoted (select pg_promote()).
+declare -a RESTORE_ARGS=()
+if bashio::config.true 'pgbackrest.restore_standby' && bashio::config.true 'pgbackrest.restore_from_repo'; then
+    RESTORE_ARGS+=(--type=standby)
+fi
 moveAside corrupted
 mkdir -p "${PGBR_POSTGRES_DATA}"
 chown postgres:postgres "${PGBR_POSTGRES_DATA}"
 chmod 700 "${PGBR_POSTGRES_DATA}"
 bashio::log.info "Restoring.."
 declare RESTORE_LOG
-RESTORE_LOG="$(pgbr_run restore 2>&1)" || { echo "${RESTORE_LOG}"; restoreFailed "pgbackrest restore returned an error"; }
+RESTORE_LOG="$(pgbr_run restore "${RESTORE_ARGS[@]}" 2>&1)" || { echo "${RESTORE_LOG}"; restoreFailed "pgbackrest restore returned an error"; }
 echo "${RESTORE_LOG}"
 
 # 4. What came back must be what the pointer says

@@ -68,6 +68,7 @@ schema:
     block_incremental: bool?
     archive_queue_max: "match(^[0-9]+(B|KiB|MiB|GiB|TiB)$)?"
     restore_from_repo: bool?
+    restore_standby: bool?
     metrics_push_url: url?
     metrics_labels:
       - "match(^[a-z_][a-z0-9_]*=[^,\"\\s]*$)?"

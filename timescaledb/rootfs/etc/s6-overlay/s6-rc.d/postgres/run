@@ -28,7 +28,11 @@ fi
 
 # A data directory restored from a pgBackRest repository starts with a recovery (recovery.signal)
 declare RECOVERING=false
-if [[ -f "${POSTGRES_DATA}/recovery.signal" ]]; then
+declare STANDBY=false
+if [[ -f "${POSTGRES_DATA}/standby.signal" ]]; then
+	RECOVERING=true
+	STANDBY=true
+elif [[ -f "${POSTGRES_DATA}/recovery.signal" ]]; then
 	RECOVERING=true
 fi
 
@@ -46,7 +50,11 @@ done
 # During a recovery the server already accepts (read only) connections, before all WAL is replayed.
 # Everything below writes, so wait until the recovery is done and the server is promoted.
 if bashio::var.true "${RECOVERING}"; then
-	bashio::log.notice "Recovering from the pgBackRest repository, waiting for the WAL replay to finish.."
+	if bashio::var.true "${STANDBY}"; then
+		bashio::log.notice "Standby: following the pgBackRest repository until promoted (select pg_promote()).."
+	else
+		bashio::log.notice "Recovering from the pgBackRest repository, waiting for the WAL replay to finish.."
+	fi
 	while [[ "$(psql -X -U postgres -d postgres -tAc 'select pg_is_in_recovery()' 2> /dev/null)" != "f" ]]; do
 		sleep 2
 	done
@@ -148,8 +156,11 @@ if bashio::var.true "${UPDATE}"; then
 	echo "${BUILD_TIMESTAMP}" > ${VERSION_FILE}
 	sleep 3
 
-	# Don't fail on the call. When running in standalone, this will fail.
-	bashio::app.restart || true
+	# A standby was just promoted to take over: a restart now would be a second outage.
+	if bashio::var.false "${STANDBY}"; then
+		# Don't fail on the call. When running in standalone, this will fail.
+		bashio::app.restart || true
+	fi
 fi
 
 # And let it roll

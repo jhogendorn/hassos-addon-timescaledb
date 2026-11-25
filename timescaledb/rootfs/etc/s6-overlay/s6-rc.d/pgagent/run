@@ -28,6 +28,11 @@ while ! psql -U "postgres" postgres -c "" 2> /dev/null; do
 	sleep 1
 done
 
+# pgAgent writes: wait for the end of a recovery, or for a standby to be promoted
+while [[ "$(psql -X -U postgres -d postgres -tAc 'select pg_is_in_recovery()' 2> /dev/null)" != "f" ]]; do
+	sleep 2
+done
+
 # Check if we need to update..
 if bashio::var.true "${UPDATE}"; then
 	bashio::log.info "PgAgent: Waiting for update to complete.."

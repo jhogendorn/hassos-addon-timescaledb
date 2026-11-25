@@ -276,10 +276,51 @@ case10() {
     check "no further backup in 20 s (the loop runs every 3 s)" bash -c "[[ \"\$(docker exec daily s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=daily info --output=json | jq -r '[.[].backup[]?] | length')\" == '${before}' ]]"
 }
 
+case11() {
+    log "11. restore_standby: follow a running primary, hand over without restarting the standby"
+    local p s; p="$(new_data primary)"; s="$(new_data standby)"
+    write_options "${p}" "$(s3_options '{"stanza": "move"}')"
+    start_addon primary "${p}"
+    wait_for 240 "the primary is up" ready primary
+    wait_for 120 "a full backup exists" bash -c "[[ \"\$(docker exec primary s6-setuidgid postgres pgbackrest --config=/run/pgbackrest/pgbackrest.conf --config-include-path=/run/pgbackrest/conf.d --stanza=move info --output=json | jq -r '[.[].backup[]?] | length')\" -ge 1 ]]"
+    psql_in primary postgres 'create table moved as select 1 as n' > /dev/null
+    psql_in primary postgres 'select pg_switch_wal()' > /dev/null
+    write_options "${s}" "$(s3_options '{"stanza": "move", "restore_from_repo": true, "restore_standby": true}' )"
+    jq '.postgresql_settings = ["wal_retrieve_retry_interval = 1s"]' "${s}/options.json" > "${s}/o" && mv "${s}/o" "${s}/options.json"
+    start_addon standby "${s}"
+    wait_for 300 "the standby follows" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc 'select count(*) from moved')\" == 1 ]]"
+    check "it is in recovery" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc 'select pg_is_in_recovery()')\" == t ]]"
+    check "restore_from_repo was cleared" bash -c "[[ \"\$(jq -r .pgbackrest.restore_from_repo '${s}/options.json')\" == false ]]"
+    docker restart standby > /dev/null
+    psql_in primary postgres 'insert into moved values (2)' > /dev/null
+    psql_in primary postgres 'select pg_switch_wal()' > /dev/null
+    wait_for 120 "a restarted standby still follows" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc 'select count(*) from moved')\" == 2 ]]"
+    check "still in recovery" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc 'select pg_is_in_recovery()')\" == t ]]"
+    check "the standby takes no backups" logs_lack standby "pgBackRest service started"
+    local started; started="$(docker inspect -f '{{.State.StartedAt}}' standby)"
+
+    # The handover: fence the primary (not WAL-logged), last row in the archive, replay it, promote
+    psql_in primary postgres 'insert into moved values (3)' > /dev/null
+    local t0 lsn; t0="$(date +%s)"
+    psql_in primary postgres 'alter system set default_transaction_read_only = on' > /dev/null
+    psql_in primary postgres 'select pg_reload_conf()' > /dev/null
+    lsn="$(psql_in primary postgres 'select pg_switch_wal()')"
+    wait_for 60 "a write on the fenced primary fails" bash -c "! docker exec primary psql -X -U postgres -tAc 'insert into moved values (99)'"
+    wait_for 60 "the standby replayed the last WAL" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc \"select pg_last_wal_replay_lsn() >= '${lsn}'\")\" == t ]]"
+    check "promotion succeeds" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc 'select pg_promote()')\" == t ]]"
+    echo "  handover took $(( $(date +%s) - t0 )) s"
+    check "every row, and no other, is there" bash -c "[[ \"\$(docker exec standby psql -X -U postgres -tAc 'select string_agg(n::text, chr(44) order by n) from moved')\" == 1,2,3 ]]"
+    check "it accepts writes: the fence stayed on the primary" psql_in standby postgres 'insert into moved values (4)'
+    docker stop primary > /dev/null
+    wait_for 120 "the service starts on the new primary" logs_have standby "pgBackRest service started"
+    wait_for 180 "and takes a backup" bash -c "docker exec standby grep -q '^backup_job_stage_success{stage=\"backup\"} 1' /data/pgbackrest/metrics.prom"
+    check "the container was not restarted by the handover" bash -c "[[ \"\$(docker inspect -f '{{.State.StartedAt}}' standby)\" == '${started}' ]]"
+}
+
 # ---- main -------------------------------------------------------------------
 
 CASES=("$@")
-[[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9 10)
+[[ ${#CASES[@]} -gt 0 ]] || CASES=(1 2 3 4 5 6 7 8 9 10 11)
 
 setup
 for c in "${CASES[@]}"; do

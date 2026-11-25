@@ -164,6 +164,10 @@ until [[ "$(sql 'select not pg_is_in_recovery()')" == "t" ]]; do
     sleep 2
 done
 
+# A promotion leaves the old timeline in pg_control until its checkpoint is done, and pgBackRest
+# refuses a backup until then: do not wait for it
+sql 'checkpoint' > /dev/null
+
 bashio::log.info "pgBackRest service started for stanza $(pgbr_stanza)."
 CREDENTIALS_SUM="$(credentialsSum)"
 
