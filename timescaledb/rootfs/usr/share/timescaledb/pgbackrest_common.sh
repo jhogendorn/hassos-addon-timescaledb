@@ -163,8 +163,8 @@ pgbr_render_secrets() {
             fi
         } > "${PGBR_SECRETS}.new"
     )
-    chown root:postgres "${PGBR_SECRETS}.new"
-    chmod 640 "${PGBR_SECRETS}.new"
+    chown postgres:postgres "${PGBR_SECRETS}.new"
+    chmod 600 "${PGBR_SECRETS}.new"
     mv "${PGBR_SECRETS}.new" "${PGBR_SECRETS}"
 }
 
